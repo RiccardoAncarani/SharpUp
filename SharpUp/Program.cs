@@ -19,6 +19,7 @@ using System.Text.RegularExpressions;
 using System.Xml;
 using Microsoft.Win32;
 using System.Security.Cryptography;
+using Mono.Cecil;
 
 
 namespace SharpUp
@@ -314,42 +315,27 @@ namespace SharpUp
             return false;
         }
 
-        public static bool CheckAccess(string Path, FileSystemRights AccessRight)
+        public static List<string> GetFoldersFromPath(string path)
         {
-            // checks if the current user has the specified AccessRight to the specified file or folder
-            // from https://stackoverflow.com/questions/1410127/c-sharp-test-if-user-has-write-access-to-a-folder/21996345#21996345
-
-            if (string.IsNullOrEmpty(Path)) return false;
-
-            try
+            List<string> dirs = new List<string>();
+            var tokens = path.Split('\\');
+            for (int i = 0; i < tokens.Length; i++)
             {
-                AuthorizationRuleCollection rules = Directory.GetAccessControl(Path).GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier));
-                WindowsIdentity identity = WindowsIdentity.GetCurrent();
-
-                foreach (FileSystemAccessRule rule in rules)
-                {
-                    if (identity.Groups.Contains(rule.IdentityReference))
-                    {
-                        if ((AccessRight & rule.FileSystemRights) == AccessRight)
-                        {
-                            if (rule.AccessControlType == AccessControlType.Allow)
-                                return true;
-                        }
-                    }
-                }
+                var t = tokens.Take(i + 1);
+                dirs.Add(String.Join("\\", t));
             }
-            catch { }
 
-            return false;
+            return dirs;
         }
 
-        public static bool CheckModifiableAccess(string Path)
+        public static bool CheckModifiableAccess(string Path, bool isFile)
         {
             // checks if the current user has rights to modify the given file/directory
             // adapted from https://stackoverflow.com/questions/1410127/c-sharp-test-if-user-has-write-access-to-a-folder/21996345#21996345
 
             if (string.IsNullOrEmpty(Path)) return false;
             // TODO: check if file exists, check file's parent folder
+           
 
             // rights that signify modiable access
             FileSystemRights[] ModifyRights =
@@ -364,21 +350,26 @@ namespace SharpUp
                 FileSystemRights.CreateFiles
             };
 
+
             ArrayList paths = new ArrayList();
             paths.Add(Path);
 
-            try
+            if (isFile)
             {
-                FileAttributes attr = System.IO.File.GetAttributes(Path);
-                if ((attr & FileAttributes.Directory) != FileAttributes.Directory)
+                
+                try
                 {
-                    string parentFolder = System.IO.Path.GetDirectoryName(Path);
-                    paths.Add(parentFolder);
+                    FileAttributes attr = System.IO.File.GetAttributes(Path);
+                    if ((attr & FileAttributes.Directory) != FileAttributes.Directory)
+                    {
+                        string parentFolder = System.IO.Path.GetDirectoryName(Path);
+                        paths.Add(parentFolder);
+                    }
                 }
-            }
-            catch
-            {
-                return false;
+                catch
+                {
+                    return false;
+                }
             }
 
 
@@ -388,10 +379,10 @@ namespace SharpUp
                 {
                     AuthorizationRuleCollection rules = Directory.GetAccessControl(candidatePath).GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier));
                     WindowsIdentity identity = WindowsIdentity.GetCurrent();
-
+                    
                     foreach (FileSystemAccessRule rule in rules)
                     {
-                        if (identity.Groups.Contains(rule.IdentityReference))
+                        if (identity.Groups.Contains(rule.IdentityReference) || rule.IdentityReference == identity.User)
                         {
                             foreach (FileSystemRights AccessRight in ModifyRights)
                             {
@@ -459,7 +450,19 @@ namespace SharpUp
                         Match path = Regex.Match(result["PathName"].ToString(), @"^\W*([a-z]:\\.+?(\.exe|\.dll|\.sys))\W*", RegexOptions.IgnoreCase);
                         String binaryPath = path.Groups[1].ToString();
 
-                        if (CheckModifiableAccess(binaryPath))
+                        if (!File.Exists(binaryPath) && !String.IsNullOrEmpty(binaryPath))
+                        {
+                            Console.WriteLine("\r\n   Service {0}: binary {1} does not exist on the system!", result["Name"], binaryPath);
+                            foreach (string dir in GetFoldersFromPath(binaryPath))
+                            {
+                                if(CheckModifiableAccess(dir, false))
+                                {
+                                    Console.WriteLine("   Directory {0} is modifiable by our user!", dir);
+                                }
+                                
+                            }
+                        }
+                        if (CheckModifiableAccess(binaryPath, true))
                         {
                             Console.WriteLine("  Name             : {0}", result["Name"]);
                             Console.WriteLine("  DisplayName      : {0}", result["DisplayName"]);
@@ -505,7 +508,7 @@ namespace SharpUp
 
             foreach (string pathFolder in pathFolders)
             {
-                if (CheckModifiableAccess(pathFolder))
+                if (CheckModifiableAccess(pathFolder, false))
                 {
                     Console.WriteLine("  Modifable %PATH% Folder  : {0}", pathFolder);
                 }
@@ -537,7 +540,7 @@ namespace SharpUp
                         Match path = Regex.Match(kvp.Value.ToString(), @"^\W*([a-z]:\\.+?(\.exe|\.bat|\.ps1|\.vbs))\W*", RegexOptions.IgnoreCase);
                         String binaryPath = path.Groups[1].ToString();
 
-                        if (CheckModifiableAccess(binaryPath))
+                        if (CheckModifiableAccess(binaryPath, true))
                         {
                             Console.WriteLine(String.Format("  HKLM:\\{0} : {1}", autorunLocation, binaryPath));
                         }
@@ -656,7 +659,7 @@ namespace SharpUp
 
                     foreach (System.Security.AccessControl.CommonAce ace in dacl)
                     {
-                        if (identity.Groups.Contains(ace.SecurityIdentifier))
+                        if (identity.Groups.Contains(ace.SecurityIdentifier) || ace.SecurityIdentifier == identity.User)
                         {
                             ServiceAccessRights serviceRights = (ServiceAccessRights)ace.AccessMask;
                             foreach (ServiceAccessRights ModifyRight in ModifyRights)
@@ -1035,7 +1038,7 @@ namespace SharpUp
                 Console.WriteLine("\r\n[*] In medium integrity but user is a local administrator- UAC can be bypassed.");
                 shouldQuit = true;
             }
-
+            shouldQuit = false;
             // if already admin we can quit without running all checks
             if (shouldQuit)
             {
@@ -1059,7 +1062,367 @@ namespace SharpUp
             GetSpecialTokenGroupPrivs();
             GetUnattendedInstallFiles();
             GetMcAfeeSitelistFiles();
+            GetUnquotedPathServices();
             GetCachedGPPPassword();
+            CheckModifiableRegistryAccess();
+            GetRegAutoLogon();
+            GetAbandonedCOMKeys();
+            GetNetRemotingServices();
+
+            //TODO
+            /*
+             * - DLL Hijacks on services using Hijackhunter
+             * - FS ACLS misconfigu
+             * - Phantom schtasks + acl check
+             * - unquoted startup programs in HKLM
+             */
+        }
+
+        private static void GetNetRemotingServices()
+        {
+            try
+            {
+                Console.WriteLine("\r\n\r\n=== .NET Remoting Services ===\r\n");
+
+                List<string> vulnSvcs = new List<string>();
+                RegistryKey services = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\");
+                foreach (var service in services.GetSubKeyNames())
+                {
+                    RegistryKey imagePath = services.OpenSubKey(service);
+                    foreach (var value in imagePath.GetValueNames())
+                    {
+                        string path = Convert.ToString(imagePath.GetValue("ImagePath"));
+                        if (!string.IsNullOrEmpty(path) && !path.Contains(".sys") && !path.Contains("system32"))
+                        {
+                            var regex = new Regex(@"^(?:[a-zA-Z]\:|\\\\[\w\.]+\\[\w.$]+)\\(?:[\w]+\\)*\w([\w.])+");
+                            var match = regex.Match(path);
+                            if (match.Success)
+                            {
+                                string targetAssembly = match.Value;
+                                try
+                                {
+                                    // Make sure that the target is actually an assembly before we get started
+                                    AssemblyName assemblyName = AssemblyName.GetAssemblyName(targetAssembly);
+                                    CheckMethods(targetAssembly);
+
+                                }
+
+                                catch (Exception)
+                                {
+                                    
+
+                                }
+                               
+                            }
+                            
+
+                        }
+
+                    }
+
+                }
+                
+                
+            }
+            
+            catch (Exception e)
+            {
+                Console.WriteLine("[-] Something went wrong: {0}", e);
+            }
+        }
+
+        static void CheckMethods(string assemblyName)
+        {
+            // Just in case we run into .NET Remoting
+            string[] dnrChannel = { };
+            string typeFilterLevel = "ldc.i4.2"; // Default opcode if not set manually
+            string filterLevel = "Low";
+            bool hit = false;
+
+            // Parse the target assembly and get its types
+            AssemblyDefinition assembly = AssemblyDefinition.ReadAssembly(assemblyName);
+            IEnumerable<TypeDefinition> allTypes = assembly.MainModule.GetTypes();
+
+            // Pull out all the type with methods that we want to look at
+            var validTypes = allTypes.SelectMany(t => t.Methods.Select(m => new { t, m }))
+                .Where(x => x.m.HasBody);
+
+            foreach (var method in validTypes)
+            {
+                // Disassemble the assembly and check for potentially vulnerable functions
+                foreach (var instruction in method.m.Body.Instructions)
+                {
+                    //Console.WriteLine($"{instruction.OpCode} \"{instruction.Operand}\""); //DEBUG
+
+                    // Deserialization checks
+                    if (instruction.OpCode.ToString() == "callvirt")
+                    {
+                        switch (instruction.Operand.ToString())
+                        {
+                            case string x when x.Contains("System.Runtime.Serialization.Formatters.Binary.BinaryFormatter::Deserialize"):
+                                Console.WriteLine("[+] BinaryFormatter::Deserialize() is called in {0}.{1}", method.t.Name, method.m.Name);
+                                Console.WriteLine("\tTypeFilterLevel: {0}", filterLevel);
+                                break;
+                            case string x when x.Contains("System.Runtime.Serialization.Json.DataContractJsonSerializer::ReadObject"):
+                                Console.WriteLine("[+] DataContractJsonSerializer::ReadObject() is called in {0}.{1}", method.t.Name, method.m.Name);
+                                break;
+                            case string x when x.Contains("System.Runtime.Serialization.Xml.DataContractSerializer::ReadObject"):
+                                Console.WriteLine("[+] DataContractSerializer::ReadObject() is called in {0}.{1}", method.t.Name, method.m.Name);
+                                break;
+                            case string x when x.Contains("System.Web.Script.Serialization.JavaScriptSerializer::Deserialize"):
+                                Console.WriteLine("[+] JavaScriptSerializer::Deserialize() is called in {0}.{1}", method.t.Name, method.m.Name);
+                                break;
+                            case string x when x.Contains("System.Web.UI.LosFormatter::Deserialize"):
+                                Console.WriteLine("[+] LosFormatter::Deserialize() is called in {0}.{1}", method.t.Name, method.m.Name);
+                                break;
+                            case string x when x.Contains("System.Runtime.Serialization.NetDataContractSerializer::ReadObject"):
+                                Console.WriteLine("[+] NetDataContractSerializer::ReadObject() is called in {0}.{1}", method.t.Name, method.m.Name);
+                                break;
+                            case string x when x.Contains("System.Runtime.Serialization.NetDataContractSerializer::Deserialize"):
+                                Console.WriteLine("[+] NetDataContractSerializer::Deserialize() is called in {0}.{1}", method.t.Name, method.m.Name);
+                                break;
+                            case string x when x.Contains("System.Web.UI.ObjectStateFormatter::Deserialize"):
+                                Console.WriteLine("[+] ObjectStateFormatter::Deserialize() is called in {0}.{1}", method.t.Name, method.m.Name);
+                                break;
+                            case string x when x.Contains("System.Runtime.Serialization.Formatters.Soap.SoapFormatter::Deserialize"):
+                                Console.WriteLine("[+] SoapFormatter::Deserialize() is called in {0}.{1}", method.t.Name, method.m.Name);
+                                break;
+                            case string x when x.Contains("System.Xml.Serialization.XmlSerializer::Deserialize"):
+                                Console.WriteLine("[+] XMLSerializer::Deserialize() is called in {0}.{1}", method.t.Name, method.m.Name);
+                                break;
+
+                            // Collect the TypeFilterLevel if it is explicitly set
+                            case string x when x.Contains("set_FilterLevel(System.Runtime.Serialization.Formatters.TypeFilterLevel)"):
+                                if (typeFilterLevel.EndsWith("3"))
+                                {
+                                    filterLevel = "Full";
+                                }
+                                break;
+                        }
+
+                    }
+
+                    if (instruction.OpCode.ToString().StartsWith("ldc.i4"))
+                    {
+                        typeFilterLevel = instruction.OpCode.ToString();
+                    }
+
+                    // .NET Remoting checks
+                    if (instruction.OpCode.ToString() == "newobj" && instruction.Operand.ToString().Contains("System.Runtime.Remoting.Channels."))
+                    {
+                        dnrChannel = instruction.Operand.ToString().Split('.');
+                    }
+
+                    if (instruction.OpCode.ToString() == "call")
+                    {
+                        switch (instruction.Operand.ToString())
+                        {
+                            case string x when x.Contains("System.Runtime.Remoting.Channels.ChannelServices::RegisterChannel"):
+                                Console.WriteLine("[+] Assembly registers a .NET Remoting channel ({0}) in {1}.{2}", dnrChannel[5], method.t.Name, method.m.Name);
+                                break;
+                        }
+                    }
+                }
+            }
+        }
+            
+        private static void GetAbandonedCOMKeys()
+        {
+            try
+            {
+                Console.WriteLine("\r\n\r\n=== Abaondoned COM Keys ===\r\n");
+                ManagementObjectSearcher searcher =
+                    new ManagementObjectSearcher("root\\CIMV2",
+                    "SELECT * FROM Win32_ClassicCOMClassSetting");
+
+                List<string> inprocsvr32 = new List<string>();
+
+                //Query all objects for their InProcSvr32 value and if not null, check that the file still exists
+                foreach (ManagementObject queryObj in searcher.Get())
+                {
+                    object inprocsvrVal = queryObj["InprocServer32"];
+                    string inprocsvrStr = Convert.ToString(inprocsvrVal);
+                    string resolvedEnvVars = Environment.ExpandEnvironmentVariables(inprocsvrStr);
+                    string path = resolvedEnvVars.Trim('"');
+
+                    if (path != null)
+                    {
+                        if (!File.Exists(path))
+                        {
+                            object clsidVal = queryObj["ComponentID"];
+                            string clsidStr = Convert.ToString(clsidVal);
+                            string missingKey = path + "," + clsidStr;
+                            if (missingKey.StartsWith("C:")) //This filters out things like combase.dll
+                                inprocsvr32.Add(missingKey);
+                        }
+                    }
+                }
+
+                List<string> distinct = inprocsvr32.Distinct().ToList();
+                List<string> cleanList = distinct.Where(s => !String.IsNullOrWhiteSpace(s)).Distinct().ToList();
+                foreach (string dll in cleanList) { Console.WriteLine("  " + dll); }
+                //Console.ReadKey();
+            }
+            catch (ManagementException e)
+            {
+                Console.WriteLine("An error occurred while querying for WMI data: " + e.Message);
+            }
+        }
+    
+
+        private static string GetServiceInstallPath(string serviceName)
+        {
+            RegistryKey regkey;
+            regkey = Registry.LocalMachine.OpenSubKey(string.Format(@"SYSTEM\CurrentControlSet\services\{0}", serviceName));
+
+            if (regkey.GetValue("ImagePath") == null)
+                return "Not Found";
+            else
+                return regkey.GetValue("ImagePath").ToString();
+        }
+
+        private static void GetUnquotedPathServices()
+        {
+            Console.WriteLine("\r\n\r\n=== Unquoted Service Paths ===\r\n");
+
+            List<string> vulnSvcs = new List<string>();
+            RegistryKey services = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\");
+            foreach (var service in services.GetSubKeyNames())
+            {
+                RegistryKey imagePath = services.OpenSubKey(service);
+                foreach (var value in imagePath.GetValueNames())
+                {
+                    string path = Convert.ToString(imagePath.GetValue("ImagePath"));
+                    if (!string.IsNullOrEmpty(path))
+                    {
+                        if (!path.Contains("\"") && path.Contains(" ")) //If path is unquoted and has a space...
+                        {
+                            if (!path.Contains("System32") && !path.Contains("system32") && !path.Contains("SysWow64")) //...and is not System32/SysWow64
+                            {
+                                vulnSvcs.Add(path);
+                            }
+                        }
+                    }
+
+                }
+
+            }
+            List<string> distinctPaths = vulnSvcs.Distinct().ToList();
+            if (!distinctPaths.Any())
+            {
+                Console.WriteLine("\r\n[-] Couldn't find any unquoted services paths");
+            }
+            else
+            {
+                Console.WriteLine("\r\n[+] Unquoted service paths found");
+                foreach (string path in distinctPaths)
+                {
+                    Console.WriteLine("  " + path);
+                }
+            }
+        }
+        public static void GetRegAutoLogon()
+        {
+            try
+            {
+                Console.WriteLine("\r\n\r\n=== Registry AutoLogon ===\r\n");
+
+                string AutoAdminLogon = GetRegValue("HKLM", "Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "AutoAdminLogon");
+
+                if (AutoAdminLogon.Equals("1"))
+                {
+                    Console.WriteLine("Registry AutoLogon Found\r\n");
+                    string DefaultDomainName = GetRegValue("HKLM", "Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "DefaultDomainName");
+                    string DefaultUserName = GetRegValue("HKLM", "Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "DefaultUserName");
+                    string DefaultPassword = GetRegValue("HKLM", "Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "DefaultPassword");
+                    string AltDefaultDomainName = GetRegValue("HKLM", "Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "AltDefaultDomainName");
+                    string AltDefaultUserName = GetRegValue("HKLM", "Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "AltDefaultUserName");
+                    string AltDefaultPassword = GetRegValue("HKLM", "Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", "AltDefaultPassword");
+
+                    if (!DefaultUserName.Equals("") || !AltDefaultUserName.Equals(""))
+                    {
+                        Console.WriteLine("DefaultDomainName: {0}", DefaultDomainName);
+                        Console.WriteLine("DefaultUserName: {0}", DefaultUserName);
+                        Console.WriteLine("DefaultPassword: {0}", DefaultPassword);
+                        Console.WriteLine("AltDefaultDomainName: {0}", AltDefaultDomainName);
+                        Console.WriteLine("AltDefaultUserName: {0}", AltDefaultUserName);
+                        Console.WriteLine("AltDefaultPassword: {0}", AltDefaultPassword);
+                    }
+                }
+
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(String.Format("  [X] Exception: {0}", ex.Message));
+            }
+        }
+
+        public static void CheckModifiableRegistryAccess()
+        {
+            // checks if the current user has rights to modify the given registry
+
+            ServiceController[] scServices;
+            scServices = ServiceController.GetServices();
+
+            // rights that signify modiable access
+            // https://docs.microsoft.com/fr-fr/dotnet/api/system.security.accesscontrol.registryrights?view=netframework-4.8
+            RegistryRights[] ModifyRights =
+            {
+                RegistryRights.ChangePermissions,
+                RegistryRights.FullControl,
+                RegistryRights.TakeOwnership,
+                RegistryRights.SetValue,
+                RegistryRights.WriteKey
+            };
+
+            Console.WriteLine("\r\n\r\n=== Modifiable Registry Services  ===\r\n");
+
+            WindowsIdentity identity = WindowsIdentity.GetCurrent();
+
+            foreach (ServiceController sc in scServices)
+            {
+                try
+                {
+                    RegistryKey key = Registry.LocalMachine.OpenSubKey("SYSTEM\\CurrentControlSet\\Services\\" + sc.ServiceName);
+                    AuthorizationRuleCollection rules = key.GetAccessControl().GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier));
+
+                    foreach (RegistryAccessRule rule in rules)
+                    {
+                        if (identity.Groups.Contains(rule.IdentityReference) || rule.IdentityReference == identity.User)
+                        {
+                            foreach (RegistryRights AccessRight in ModifyRights)
+                            {
+                                if ((AccessRight & rule.RegistryRights) == AccessRight)
+                                {
+                                    if (rule.AccessControlType == AccessControlType.Allow)
+                                    {
+                                        ManagementObjectSearcher wmiData = new ManagementObjectSearcher(@"root\cimv2", String.Format("SELECT * FROM win32_service WHERE Name LIKE '{0}'", sc.ServiceName));
+                                        ManagementObjectCollection data = wmiData.Get();
+
+                                        foreach (ManagementObject result in data)
+                                        {
+                                            Console.WriteLine("  Name             : {0}", result["Name"]);
+                                            Console.WriteLine("  DisplayName      : {0}", result["DisplayName"]);
+                                            Console.WriteLine("  Description      : {0}", result["Description"]);
+                                            Console.WriteLine("  RegistryKey      : {0}", "SYSTEM\\CurrentControlSet\\Services\\" + sc.ServiceName);
+                                            Console.WriteLine("  State            : {0}", result["State"]);
+                                            Console.WriteLine("  StartMode        : {0}", result["StartMode"]);
+                                            Console.WriteLine("  PathName         : {0}", result["PathName"]);
+                                        }
+                                        break;
+                                    }
+
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(String.Format("  [X] Exception: {0}", ex.Message));
+                }
+            }
+
         }
 
         static void Main(string[] args)
