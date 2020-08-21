@@ -26,6 +26,7 @@ namespace SharpUp
 {
     class Program
     {
+        
         [DllImport("advapi32", CharSet = CharSet.Auto, SetLastError = true)]
         static extern bool ConvertSidToStringSid(IntPtr pSID, out IntPtr ptrSid);
 
@@ -335,7 +336,7 @@ namespace SharpUp
 
             if (string.IsNullOrEmpty(Path)) return false;
             // TODO: check if file exists, check file's parent folder
-           
+
 
             // rights that signify modiable access
             FileSystemRights[] ModifyRights =
@@ -356,7 +357,7 @@ namespace SharpUp
 
             if (isFile)
             {
-                
+
                 try
                 {
                     FileAttributes attr = System.IO.File.GetAttributes(Path);
@@ -379,7 +380,7 @@ namespace SharpUp
                 {
                     AuthorizationRuleCollection rules = Directory.GetAccessControl(candidatePath).GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier));
                     WindowsIdentity identity = WindowsIdentity.GetCurrent();
-                    
+
                     foreach (FileSystemAccessRule rule in rules)
                     {
                         if (identity.Groups.Contains(rule.IdentityReference) || rule.IdentityReference == identity.User)
@@ -430,7 +431,74 @@ namespace SharpUp
         }
 
 
+        public static List<string> GetDirectories(string path, string searchPattern = "*",
+        SearchOption searchOption = SearchOption.AllDirectories)
+        {
+            if (searchOption == SearchOption.TopDirectoryOnly)
+                return Directory.GetDirectories(path, searchPattern).ToList();
+
+            var directories = new List<string>(GetDirectories(path, searchPattern));
+
+            for (var i = 0; i < directories.Count; i++)
+                directories.AddRange(GetDirectories(directories[i], searchPattern));
+
+            return directories;
+        }
+
+        private static List<string> GetDirectories(string path, string searchPattern)
+        {
+            try
+            {
+                return Directory.GetDirectories(path, searchPattern).ToList();
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return new List<string>();
+            }
+        }
+
+       
+  
+
         // privesc checks
+        
+        public static void GetFileSystemACLMisconfigurations()
+        {
+            Console.WriteLine("\r\n\r\n=== Filesystem ACL Misconfigurations ===\r\n");
+            string rootDrive = Path.GetPathRoot(Environment.SystemDirectory);
+            var dirs = Directory.GetDirectories(rootDrive);
+            foreach (string d in dirs)
+            {
+                if(CheckModifiableAccess(d, false))
+                {
+                    Console.WriteLine("   {0} is modifiable by the current user!", d);
+                }
+            }
+
+            string[] progr = { rootDrive + "Program Files\\", rootDrive + "Program Files (x86)\\"};
+            foreach (var d in progr)
+            {
+                var programDirs = GetDirectories(d, "*", SearchOption.AllDirectories);
+                foreach (string programDir in programDirs)
+                {
+                    if(CheckModifiableAccess(programDir, false))
+                    {
+                        Console.WriteLine("   {0} is modifiable by the current user!", programDir);
+                    }
+
+                    var files = FindFiles(programDir, "*.dll;*.exe");
+                    foreach(string f in files)
+                    {
+                        if(CheckModifiableAccess(f, true))
+                        {
+                            Console.WriteLine("   {0} is modifiable by the current user!", f);
+                        }
+                    }
+                }
+            }
+            
+        }
+
         public static void GetModifiableServiceBinaries()
         {
             try
@@ -1068,6 +1136,7 @@ namespace SharpUp
             GetRegAutoLogon();
             GetAbandonedCOMKeys();
             GetNetRemotingServices();
+            GetFileSystemACLMisconfigurations();
 
             //TODO
             /*
